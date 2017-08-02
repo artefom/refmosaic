@@ -10,10 +10,36 @@ import os
 import traceback
 import tempfile
 import time
+from sklearn.linear_model import Ridge
 from PIL import Image
 
 image_processing_scale = 1
 
+def transform_colors(target, source, scale=0.5):
+    X = source.reshape((-1, 3))
+
+    Yr = target.reshape((-1, 3))[:, 0] / 255
+    Yg = target.reshape((-1, 3))[:, 1] / 255
+    Yb = target.reshape((-1, 3))[:, 2] / 255
+
+    clf = Ridge()
+
+    clf.fit(X, Yr)
+    ret_r = clf.predict(X)
+
+    clf.fit(X, Yg)
+    ret_g = clf.predict(X)
+
+    clf.fit(X, Yb)
+    ret_b = clf.predict(X)
+
+    ret = np.concatenate((ret_r[:, np.newaxis], ret_g[:, np.newaxis], ret_b[:, np.newaxis]), axis=1).reshape(
+        source.shape) * 255
+    ret = (source * (1 - scale) + ret * scale)
+    ret[ret > 255] = 255
+    ret[ret < 0] = 0
+    ret = ret.astype(np.uint8)
+    return ret
 
 def sorted_merge_iterator(merged_arrays, key):
     iterators = []
@@ -234,8 +260,14 @@ def crop_image(inputimage : Image, target_size, method=Image.NEAREST):
 
 
 
+def dist_abs(img1,img2):
+    return np.abs(img1.astype(np.float32)-img2.astype(np.float32)).mean()
+
+def dist2_sqrt(img1,img2):
+    return ((img1.astype(np.float32)-img2.astype(np.float32))**2).mean()/100
+
 def generate_fits(target, target_tile_size, tile_shape, tile,
-                  tile_data, tile_index):
+                  tile_data, tile_index,distance_method=dist_abs):
     source = tile_data  # source tile data
     source_size = tile[1:3]  # source size in tiles
 
@@ -245,6 +277,7 @@ def generate_fits(target, target_tile_size, tile_shape, tile,
     xy_pairs = np.array(np.meshgrid(x_ticks, y_ticks), dtype=np.int32).T.reshape(-1, 2)
 
     ret = []
+
     for x, y in xy_pairs:
         fit_img = target[y * tile_shape[0]:(y + source_size[0]) * tile_shape[0],
                   x * tile_shape[1]:(x + source_size[1]) * tile_shape[1]]
@@ -254,8 +287,8 @@ def generate_fits(target, target_tile_size, tile_shape, tile,
 
         # score = int( np.round((np.abs(source-fit_img).mean()-np.sqrt(size_weight*source_size[0]*source_size[1])*128)*100) )
         # convert to float to prevent integer overflow
-        score = np.abs(source.astype(np.float32) - fit_img.astype(np.float32) ).mean()
-        # score = score - size_weight * np.sqrt(source_size[0] * source_size[1]) * 128
+
+        score = distance_method(source,fit_img)
         ret.append((tile_index, score, x, y))
 
     return ret
@@ -285,8 +318,10 @@ def tiles_from_img(tile_shape, path, max_tiles=5):
 
     tiles_num = np.array([1, 1], dtype=np.float64)
     ret_pool.append((crop_image(img, tiles_num * tile_shape), tiles_num.astype(np.uint16)))
-    tiles_num[max_index] = 2
-    ret_pool.append((crop_image(img, tiles_num * tile_shape), tiles_num.astype(np.uint16)))
+
+    if max_tiles > 1:
+        tiles_num[max_index] = 2
+        ret_pool.append((crop_image(img, tiles_num * tile_shape), tiles_num.astype(np.uint16)))
 
     for i in np.arange(2, tiles_num_max[max_index] + 1)[::-1]:
 
@@ -302,7 +337,7 @@ def tiles_from_img(tile_shape, path, max_tiles=5):
     return ret_pool
 
 def cache_images( target_image, target_tile_size, image_path_pool, tile_shape,
-                 tile_max_size, verbose=True):
+                 tile_max_size, verbose=True, distance_method=dist_abs):
     """
     Creates array of tiles and sorted array fits.
     tiles are [ (image_id,tile_shape_x,tile_shape_y), ... ]
@@ -329,7 +364,7 @@ def cache_images( target_image, target_tile_size, image_path_pool, tile_shape,
 
     for i, f in enumerate(image_path_pool):
         if verbose and i % 4 == 0:
-            print('{} of {} images processed ({} failed), {} tiles, {} fits generated' \
+            print('Caching {} of {} images ({} failed). {} tiles, {} fits generated' \
                   .format(i, len(image_path_pool), len(failed), len(tiles),
                           np.array([len(i) for i in fits if i is not None]).sum()), end='\n')
         try:
@@ -344,7 +379,8 @@ def cache_images( target_image, target_tile_size, image_path_pool, tile_shape,
                 tiles.append((img_index, ts[0], ts[1]))
 
                 generated_fits = generate_fits(target_image, target_tile_size,
-                                          tile_shape, tiles[tile_id], image_to_array(data) , tile_id)
+                                          tile_shape, tiles[tile_id], image_to_array(data) , tile_id,
+                                          distance_method=distance_method)
 
                 fits[ts[0]*ts[1]].extend(generated_fits)
 
@@ -364,9 +400,10 @@ def cache_images( target_image, target_tile_size, image_path_pool, tile_shape,
                 del exc_info
             break
 
-    print('Failed to read images:')
-    for i in failed:
-        print(i)
+    if len(failed) > 0:
+        print('Failed to read images:')
+        for i in failed:
+            print(i)
 
     # sort all fits by score
     for i in range(len(fits)):
@@ -455,7 +492,7 @@ def find_best_fits(target_image_tile_size, tiles, fits, image_repetition=1,
         for tile_id, score, x, y in sorted_merge_iterator(fits,key=lambda x: x[1]-tiles[x[0]][0]*tiles[x[0]][1]*128*size_weight ):
             if i % 44263 == 0:
                 total = np.array([len(i) for i in fits if i is not None]).sum()
-                print('{} of {} ({:.0f}%), filled {:.2f}%'.format(i,
+                print('Filling image, {} of {} ({:.0f}%) fits used, filled {:.2f}%'.format(i,
                                                                   total,
                                                                   i / total * 100,
                                 100 - (image == -1).sum() / image.size * 100))
@@ -526,14 +563,9 @@ def get_tile_size_num(ref_img_shape, aspect, num_images, res=2) -> ((int, int), 
 
 
 def assemble_image(tiles_num, tile_shape, paths, tiles, fits, ref_img=None, guess_size=True, \
-                   mode='average', max_size=2000, p=5, overflow_error=True):
-    pixels_per_tile_height = np.zeros(tiles_num)
-    pixels_per_tile_width = np.zeros(tiles_num)
+                   mode='average', max_size=2000, p=5, overflow_error=True,color_correction_scale = 0.5):
 
     scales = []
-
-    #     images = []
-
 
     if guess_size:
         print("Guessing image size...")
@@ -586,16 +618,21 @@ def assemble_image(tiles_num, tile_shape, paths, tiles, fits, ref_img=None, gues
     final_image_size = (final_tile_size * tiles_num).astype(np.int32)
     final_image_mb_size = int(final_image_size[0]) * int(final_image_size[1]) * 3 / 1024 / 1024
 
-    if final_image_mb_size > 1024 * 1.5:
+    if final_image_mb_size > 1024 * 2:
         if overflow_error:
             raise ValueError(
-                "Final image size is over 1.5 GB ({:.0f}MB), it may not fit into memory".format(final_image_mb_size))
+                "Final image size is over 2 GB ({:.0f}MB), it may not fit into memory".format(final_image_mb_size))
         else:
             print("Warning! Final image is too large ({:.0f}MB)".format(final_image_mb_size))
             raise ValueError("Nope")
     print('Final image size: {} {} ({:.2f} MB)'.format(*final_image_size, final_image_mb_size))
 
-    ret = np.zeros((*final_image_size, 3), dtype=np.uint8)
+    if color_correction_scale > 0:
+        ret = image_to_array( ref_img.resize((final_image_size[1],final_image_size[0])) )
+    else:
+        ret = np.zeros((*final_image_size, 3), dtype=np.uint8)
+
+    # ret = image_to_array( ref_img.resize((final_image_size[1],final_image_size[0])) )
 
     fits_final_paths = np.array([paths[tiles[tile_id][0]] for tile_id, tile_x, tile_y in fits])
     fits_sorted_ids = np.array(sorted(list(range(len(fits))), key=lambda i: fits_final_paths[i]))
@@ -618,7 +655,7 @@ def assemble_image(tiles_num, tile_shape, paths, tiles, fits, ref_img=None, gues
 
     for i, (tile_id, tile_x, tile_y) in enumerate(fits):
         if i%4 == 0:
-            print("Assembling image {} of {}".format(i + 1, len(fits)))
+            print("Baking images to output {} of {}".format(i + 1, len(fits)))
         tile = tiles[tile_id]
         tile_tiles_num = tile[1:3]
         img_path = paths[tile[0]]
@@ -628,40 +665,53 @@ def assemble_image(tiles_num, tile_shape, paths, tiles, fits, ref_img=None, gues
 
         img_cropped = image_to_array( crop_image(img, crop_size,method=Image.ANTIALIAS) )
 
+        if color_correction_scale > 0:
+            color_ref = ret[tile_y * final_tile_size[0]:(tile_y + tile_tiles_num[0]) * final_tile_size[0],
+            tile_x * final_tile_size[1]:(tile_x + tile_tiles_num[1]) * final_tile_size[1], :]
+            img_cropped = transform_colors(color_ref,img_cropped,color_correction_scale)
+
         ret[tile_y * final_tile_size[0]:(tile_y + tile_tiles_num[0]) * final_tile_size[0],
         tile_x * final_tile_size[1]:(tile_x + tile_tiles_num[1]) * final_tile_size[1], :] = img_cropped
 
     return ret
 
-def get_final_fits_exact(ref_img_path, input_images, res=5, final_image_size_mode = 'average',result_image_max_size=2000):
-    ref_img = Image.open(ref_img_path)
+def get_final_fits_exact(ref_img_path, input_images, res=5, final_image_size_mode = 'average',
+                         result_image_max_size=2000,distance_method=dist_abs,
+                         color_correction_scale=0.5):
+
+    ref_img_original = Image.open(ref_img_path)
+    ref_img = ref_img_original
 
     tile_shape, tiles_num = get_tile_size_num((ref_img.size[1],ref_img.size[0]), get_aspect_ratio(input_images), len(input_images), res=res)
 
     ref_img = image_to_array( crop_image(ref_img, tile_shape * tiles_num) )
 
-    tiles, fits = cache_images(ref_img, tiles_num, input_images, tile_shape, tile_max_size=2)
+    tiles, fits = cache_images(ref_img, tiles_num, input_images, tile_shape, tile_max_size=2,distance_method=distance_method)
 
     fit_img, fits_final = find_best_fits(tiles_num, tiles, fits, use_all=True, num_input_images=len(input_images))
 
-    result = assemble_image(tiles_num,tile_shape,input_images,tiles,fits_final, mode=final_image_size_mode)
+    result = assemble_image(tiles_num,tile_shape,input_images,tiles,fits_final,
+                            mode=final_image_size_mode, max_size=result_image_max_size, ref_img=ref_img_original,
+                            color_correction_scale=color_correction_scale)
 
     return result
 
 def get_final_fits(ref_img_path, input_images, res=5, output_collage_images_num=None, size_weight=0.0,
                    horizontal_tiles=None, vertical_tiles=None, max_patch_size=9,
-                   final_image_size_mode='average',result_image_max_size=2000):
+                   final_image_size_mode='average',result_image_max_size=2000,
+                   distance_method=dist_abs, image_repetition=1,color_correction_scale=0.5):
 
 
     if output_collage_images_num is None:
         output_collage_images_num = len(input_images)
 
-    ref_img = Image.open(ref_img_path)
+    ref_img_original = Image.open(ref_img_path)
+    ref_img = ref_img_original
 
     if (horizontal_tiles is not None and vertical_tiles is not None) and\
-            (horizontal_tiles >= 0 and vertical_tiles >= 0):
+            (horizontal_tiles > 0 and vertical_tiles > 0):
         tiles_num = np.array( (vertical_tiles,horizontal_tiles) )
-        tile_shape = np.floor(ref_img.size[1]/tiles_num[0],ref_img.size[0]/tiles_num[1]).astype(np.int)
+        tile_shape = np.floor( (ref_img.size[1]/tiles_num[0],ref_img.size[0]/tiles_num[1]) ).astype(np.int)
         if tile_shape[0] == 0 or tile_shape[1] == 0:
             print('tile dimensions ({}) should be >= 0, possibly invalid tiles_num: {}'.format(tile_shape,tiles_num))
     else:
@@ -669,10 +719,13 @@ def get_final_fits(ref_img_path, input_images, res=5, output_collage_images_num=
                                               output_collage_images_num, res=res)
     print( 'Image splitted into ({} x {}) tiles'.format(*tiles_num) )
     ref_img = image_to_array( crop_image(ref_img, tile_shape * tiles_num) )
-    tiles, fits = cache_images(ref_img, tiles_num, input_images, tile_shape, tile_max_size=max_patch_size)
-    fit_img, fits_final = find_best_fits(tiles_num,tiles,fits,size_weight=size_weight)
+    tiles, fits = cache_images(ref_img, tiles_num, input_images, tile_shape, tile_max_size=max_patch_size,
+                               distance_method=distance_method)
+    fit_img, fits_final = find_best_fits(tiles_num,tiles,fits,size_weight=size_weight,image_repetition=image_repetition)
 
-    result = assemble_image(tiles_num,tile_shape,input_images,tiles,fits_final,mode=final_image_size_mode)
+    result = assemble_image(tiles_num,tile_shape,input_images,tiles,fits_final,
+                            mode=final_image_size_mode,max_size=result_image_max_size,ref_img=ref_img_original,
+                            color_correction_scale=color_correction_scale)
 
     return result
 
@@ -680,40 +733,88 @@ def get_final_fits(ref_img_path, input_images, res=5, output_collage_images_num=
 def main():
 
 
-    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser = argparse.ArgumentParser(description='Image mosaicing by reference')
     parser.add_argument('ref_file', metavar='ref_file', type=str, nargs=1,
                         help='reference image')
     parser.add_argument('input_files', metavar='input_files', type=str, nargs='+',
-                        help='file, or mask, determines input files for mosaicing')
+                        help='paths, determines input files for mosaicing. '
+                             'you can provide text file with path on each line as input file')
     parser.add_argument('output_file', metavar='output_file', type=str, nargs=1,
                         help='file to which output will be written')
-    parser.add_argument('--foo', action='store_true')
+    parser.add_argument('--useall', dest='useall',type=int,default=1,
+                        help='1 or 0, Should final image contain exactly all input images? (default=1)')
+    parser.add_argument('--reps',dest='reps',type=int,default=1,
+                        help='maximum number of image repetition. only avaliable when --useall=0 (default = 1)')
+    parser.add_argument('--max_patch_size',dest='max_patch_size',type=int,default=9,
+                        help='maximum area of patches. only avaliable when --useall=0.'
+                             ' (use 1 to force all output images same size) (default=9)')
+    parser.add_argument('--size_weight',dest='size_weight',type=int,default=0.0,
+                        help='higher values will yield more bigger images in output. '
+                             'only avaliable when --useall=0 (default=0)')
+    parser.add_argument('--vtiles',dest='vtiles',type=int,default=0,
+                        help='number of vertical tiles (use with --htiles). only avaluable when --useall=0')
+    parser.add_argument('--htiles',dest='htiles',type=int,default=0,
+                        help='number of horisontal tiles (use with --vtiles). only avaliable when --useall=0')
+    parser.add_argument('--max_images',dest='max_images',type=int,default=2000,
+                        help='when useall is 0, restricts maximum number of images in output (default=2000)')
+    parser.add_argument('--cc_scale', dest='cc_scale', type=float, default=0.2,
+                        help='scale of color correction, from 0 to 1 (default = 0.2)')
+    parser.add_argument('--resolution',dest='resolution',type=int,default=5,
+                        help='resolution of distance measuring and tile fitting, higher values may '
+                             'lead to bigger memory consumption and computition times (default=5)')
+    parser.add_argument('--output_max_size',dest='output_max_size',type=int,default=2000,
+                        help='maximum width or height of output image (default=2000)')
+    parser.add_argument('--output_resolution',dest='output_res',type=str,default='average',
+                        help='Method to deduct resolution of output image, but not bigger than output_max_size.'
+                             ' Use one of: "average"-resolution is average of tiles resolution,'
+                             ' "max"-maximum of tiles resolution, "min"-min of tiles resolution')
+    parser.add_argument('--dist',dest='distance_method',type=str,default='abs',
+                        help='abs or sqrt - methods to measure tile fitness. (default=abs)'
+                             'abs - absolute mean error, '
+                             'sqrt - squared mean error.')
+
+
     args = parser.parse_args()
 
     # images with higher area may socre higher in final image, set this parameter
     # to control number of large images in output collage
-    size_weight = 0.5
+    size_weight = args.size_weight
 
     # maximum number of tiles which one patch may contain in final image
-    max_patch_size = 9
+    max_patch_size = args.max_patch_size
 
     # maximum number of images to be used in collage (used when fit is non-exact)
     # flot for image fraction, int for absolute value
-    max_num_images = 2000
+    max_num_images = args.max_images
 
     # number of vertical tiles in final image
-    tiles_vertical = None
+    tiles_vertical = args.vtiles
     # number of horisontal tiles in final image
-    tiles_horisontal = None
+    tiles_horisontal = args.htiles
 
     # fit resolution, bigger value, better fit
-    resolution = 5
+    resolution = args.resolution
 
-    use_all = False
+    use_all = bool( args.useall )
 
-    result_image_resolution = 'average'
+    result_image_resolution = args.output_res
 
-    result_image_max_size = 2000
+    result_image_max_size = args.output_max_size
+
+    distance_method_str = args.distance_method
+
+    image_repetition = args.reps
+
+    color_correction_scale = args.cc_scale
+
+    if distance_method_str == 'abs':
+        distance_method = dist_abs
+    elif distance_method_str == 'sqrt':
+        distance_method = dist2_sqrt
+    else:
+        print('Uknown distance metric: {}'.format(distance_method_str))
+        print('Use one of following: "abs", "sqrt"')
+        exit(1)
 
     # parsing input files
     if len(args.input_files) == 1:
@@ -734,18 +835,37 @@ def main():
 
                 args.input_files = files
 
+    # print(
+    #     'size_weight:', size_weight, '\n',
+    #     'max_patch_size:', max_patch_size, '\n',
+    #     'max_num_images:', max_num_images, '\n',
+    #     'tiles_vertical:', tiles_vertical, '\n',
+    #     'tiles_horisontal:', tiles_horisontal, '\n',
+    #     'resolution:', resolution, '\n',
+    #     'use_all:', use_all, '\n',
+    #     'result_image_resolution:', result_image_resolution, '\n',
+    #     'result_image_max_size:', result_image_max_size, '\n',
+    #     'distance_method:', distance_method, '\n'
+    # )
+    # a = None
+    # input(a)
+
     # if we should use all input images
     if use_all:
         img_final = get_final_fits_exact(args.ref_file[0],args.input_files,res=resolution,
                                          final_image_size_mode=result_image_resolution,
-                                         result_image_max_size=result_image_max_size)
+                                         result_image_max_size=result_image_max_size,
+                                         distance_method=distance_method,
+                                         color_correction_scale=color_correction_scale)
     else:
         img_final = get_final_fits(args.ref_file[0],args.input_files,res=resolution,
                                    vertical_tiles=tiles_vertical,horizontal_tiles=tiles_horisontal,
                                    output_collage_images_num=max_num_images,size_weight=size_weight,
                                    final_image_size_mode=result_image_resolution,
                                    result_image_max_size=result_image_max_size,
-                                   max_patch_size=max_patch_size)
+                                   max_patch_size=max_patch_size,
+                                   distance_method=distance_method,image_repetition=image_repetition,
+                                   color_correction_scale=color_correction_scale)
 
     Image.fromarray(img_final.astype(np.uint8), 'RGB').save(args.output_file[0])
     # arr = result[:, :, np.newaxis].astype(np.float64)
